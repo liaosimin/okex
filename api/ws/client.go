@@ -84,22 +84,10 @@ func (c *ClientWs) Connect(p bool) error {
 		return nil
 	}
 	err := c.dial(p)
-	if err == nil {
-		return nil
+	if err != nil {
+		return err
 	}
-	ticker := time.NewTicker(redialTick)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			err = c.dial(p)
-			if err == nil {
-				return nil
-			}
-		case <-c.ctx.Done():
-			return c.handleCancel("connect")
-		}
-	}
+	return nil
 }
 
 // Login
@@ -171,16 +159,14 @@ func (c *ClientWs) Unsubscribe(p bool, ch []okex.ChannelName, args map[string]st
 // Send message through either connections
 func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, extras ...map[string]string) error {
 	if op != okex.LoginOperation {
-		err := c.Connect(p)
-		if err == nil {
-			if p {
-				err = c.WaitForAuthorization()
-				if err != nil {
-					return err
-				}
-			}
-		} else {
+		if err := c.Connect(p); err != nil {
 			return err
+		}
+		if p {
+			err := c.WaitForAuthorization()
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -240,16 +226,17 @@ func (c *ClientWs) WaitForAuthorization() error {
 
 func (c *ClientWs) dial(p bool) error {
 	c.mu[p].Lock()
+	defer c.mu[p].Unlock()
 	conn, res, err := c.dialer.Dial(string(c.url[p]), nil)
 	if err != nil {
 		var statusCode int
 		if res != nil {
 			statusCode = res.StatusCode
 		}
-		return fmt.Errorf("error %d: %w", statusCode, err)
+		fmt.Printf("dail url:%s err:%v res:%+v \n", c.url[p], err, res)
+		return fmt.Errorf("dail url:%s err:%v statusCode:%d", c.url[p], err, statusCode)
 	}
 	c.conn[p] = conn
-	c.mu[p].Unlock()
 
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
