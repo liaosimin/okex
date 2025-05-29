@@ -31,7 +31,10 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, destin
 	}
 
 	r := rest.NewClient(apiKey, secretKey, passphrase, restURL, destination)
-	c := ws.NewClient(ctx, apiKey, secretKey, passphrase, map[bool]okex.BaseURL{true: wsPriURL, false: wsPubURL})
+	c, err := ws.NewClient(ctx, apiKey, secretKey, passphrase, map[bool]okex.BaseURL{true: wsPriURL, false: wsPubURL})
+	if err != nil {
+		return nil, err
+	}
 
 	return &Client{r, c, ctx}, nil
 }

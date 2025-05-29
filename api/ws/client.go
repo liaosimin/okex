@@ -11,8 +11,9 @@ import (
 	"github.com/amir-the-h/okex/events"
 	"github.com/gorilla/websocket"
 	"io"
+	"log"
 	"net/http"
-	"sync"
+	"os"
 	"time"
 )
 
@@ -20,7 +21,6 @@ import (
 //
 // https://www.okex.com/docs-v5/en/#websocket-api
 type ClientWs struct {
-	Cancel              context.CancelFunc
 	DoneChan            chan interface{}
 	StructuredEventChan chan interface{}
 	RawEventChan        chan *events.Basic
@@ -36,14 +36,13 @@ type ClientWs struct {
 	apiKey              string
 	secretKey           []byte
 	passphrase          string
-	lastTransmit        map[bool]*time.Time
-	mu                  map[bool]*sync.RWMutex
 	AuthRequested       *time.Time
 	Authorized          bool
 	Private             *Private
 	Public              *Public
 	Trade               *Trade
 	ctx                 context.Context
+	Logger              *log.Logger
 }
 
 const (
@@ -54,26 +53,29 @@ const (
 )
 
 // NewClient returns a pointer to a fresh ClientWs
-func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url map[bool]okex.BaseURL) *ClientWs {
-	ctx, cancel := context.WithCancel(ctx)
+func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url map[bool]okex.BaseURL) (*ClientWs, error) {
 	c := &ClientWs{
-		apiKey:       apiKey,
-		secretKey:    []byte(secretKey),
-		passphrase:   passphrase,
-		ctx:          ctx,
-		Cancel:       cancel,
-		url:          url,
-		sendChan:     map[bool]chan []byte{true: make(chan []byte, 3), false: make(chan []byte, 3)},
-		DoneChan:     make(chan interface{}),
-		conn:         make(map[bool]*websocket.Conn),
-		dialer:       websocket.DefaultDialer,
-		lastTransmit: make(map[bool]*time.Time),
-		mu:           map[bool]*sync.RWMutex{true: {}, false: {}},
+		apiKey:     apiKey,
+		secretKey:  []byte(secretKey),
+		passphrase: passphrase,
+		ctx:        ctx,
+		url:        url,
+		sendChan:   map[bool]chan []byte{true: make(chan []byte, 3), false: make(chan []byte, 3)},
+		DoneChan:   make(chan interface{}),
+		conn:       map[bool]*websocket.Conn{true: nil, false: nil},
+		dialer:     websocket.DefaultDialer,
+		Logger:     log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile),
 	}
 	c.Private = NewPrivate(c)
 	c.Public = NewPublic(c)
 	c.Trade = NewTrade(c)
-	return c
+	if err := c.Connect(true); err != nil {
+		return nil, err
+	}
+	if err := c.Connect(false); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // Connect into the server
@@ -83,10 +85,36 @@ func (c *ClientWs) Connect(p bool) error {
 	if c.conn[p] != nil {
 		return nil
 	}
-	err := c.dial(p)
+	conn, res, err := c.dialer.Dial(string(c.url[p]), nil)
 	if err != nil {
-		return err
+		var statusCode int
+		if res != nil {
+			statusCode = res.StatusCode
+		}
+		fmt.Printf("dail url:%s err:%v res:%+v \n", c.url[p], err, res)
+		return fmt.Errorf("dail url:%s err:%v statusCode:%d", c.url[p], err, statusCode)
 	}
+	c.conn[p] = conn
+
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			fmt.Printf("error closing body: %v\n", err)
+		}
+	}(res.Body)
+	go func() {
+		err := c.receiver(p)
+		if err != nil {
+			fmt.Printf("receiver error: %v\n", err)
+		}
+	}()
+	go func() {
+		err := c.sender(p)
+		if err != nil {
+			fmt.Printf("sender error: %v\n", err)
+		}
+	}()
+
 	return nil
 }
 
@@ -224,79 +252,31 @@ func (c *ClientWs) WaitForAuthorization() error {
 	return nil
 }
 
-func (c *ClientWs) dial(p bool) error {
-	c.mu[p].Lock()
-	defer c.mu[p].Unlock()
-	conn, res, err := c.dialer.Dial(string(c.url[p]), nil)
-	if err != nil {
-		var statusCode int
-		if res != nil {
-			statusCode = res.StatusCode
-		}
-		fmt.Printf("dail url:%s err:%v res:%+v \n", c.url[p], err, res)
-		return fmt.Errorf("dail url:%s err:%v statusCode:%d", c.url[p], err, statusCode)
-	}
-	c.conn[p] = conn
-
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
-			fmt.Printf("error closing body: %v\n", err)
-		}
-	}(res.Body)
-	go func() {
-		err := c.receiver(p)
-		if err != nil {
-			fmt.Printf("receiver error: %v\n", err)
-		}
-	}()
-	go func() {
-		err := c.sender(p)
-		if err != nil {
-			fmt.Printf("sender error: %v\n", err)
-		}
-	}()
-
-	return nil
-}
-
 func (c *ClientWs) sender(p bool) error {
 	ticker := time.NewTicker(time.Millisecond * 300)
 	defer ticker.Stop()
 	for {
 		select {
 		case data := <-c.sendChan[p]:
-			c.mu[p].RLock()
 			err := c.conn[p].SetWriteDeadline(time.Now().Add(writeWait))
 			if err != nil {
-				c.mu[p].RUnlock()
 				return err
 			}
 			w, err := c.conn[p].NextWriter(websocket.TextMessage)
 			if err != nil {
-				c.mu[p].RUnlock()
 				return err
 			}
 			if _, err = w.Write(data); err != nil {
-				c.mu[p].RUnlock()
 				return err
 			}
-			now := time.Now()
-			c.lastTransmit[p] = &now
-			c.mu[p].RUnlock()
 			if err := w.Close(); err != nil {
 				return err
 			}
 		case <-ticker.C:
-			c.mu[p].RLock()
-			conn := c.conn[p]
-			lastTransmit := c.lastTransmit[p]
-			c.mu[p].RUnlock()
-			if conn != nil && (lastTransmit == nil || (lastTransmit != nil && time.Since(*lastTransmit) > PingPeriod)) {
-				go func() {
-					c.sendChan[p] <- []byte("ping")
-				}()
-			}
+			go func() {
+				c.sendChan[p] <- []byte("ping")
+			}()
+
 		case <-c.ctx.Done():
 			return c.handleCancel("sender")
 		}
@@ -309,25 +289,17 @@ func (c *ClientWs) receiver(p bool) error {
 		case <-c.ctx.Done():
 			return c.handleCancel("receiver")
 		default:
-			c.mu[p].RLock()
 			err := c.conn[p].SetReadDeadline(time.Now().Add(pongWait))
 			if err != nil {
-				c.mu[p].RUnlock()
 				return err
 			}
 			mt, data, err := c.conn[p].ReadMessage()
 			if err != nil {
-				c.mu[p].RUnlock()
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					return c.conn[p].Close()
 				}
 				return err
 			}
-			c.mu[p].RUnlock()
-			now := time.Now()
-			c.mu[p].Lock()
-			c.lastTransmit[p] = &now
-			c.mu[p].Unlock()
 			if mt == websocket.TextMessage && string(data) != "pong" {
 				e := &events.Basic{}
 				if err := json.Unmarshal(data, &e); err != nil {
