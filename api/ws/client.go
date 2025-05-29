@@ -36,8 +36,6 @@ type ClientWs struct {
 	apiKey              string
 	secretKey           []byte
 	passphrase          string
-	AuthRequested       *time.Time
-	Authorized          bool
 	Private             *Private
 	Public              *Public
 	Trade               *Trade
@@ -55,7 +53,7 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 		passphrase: passphrase,
 		ctx:        ctx,
 		url:        url,
-		sendChan:   map[bool]chan []byte{true: make(chan []byte, 3), false: make(chan []byte, 3)},
+		sendChan:   map[bool]chan []byte{true: make(chan []byte, 100), false: make(chan []byte, 100)},
 		DoneChan:   make(chan interface{}),
 		conn:       map[bool]*websocket.Conn{true: nil, false: nil},
 		dialer:     websocket.DefaultDialer,
@@ -68,6 +66,10 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 		return nil, err
 	}
 	if err := c.Connect(false); err != nil {
+		return nil, err
+	}
+	if err := c.Login(); err != nil {
+		c.Logger.Println("login error:", err)
 		return nil, err
 	}
 	return c, nil
@@ -117,14 +119,6 @@ func (c *ClientWs) Connect(p bool) error {
 //
 // https://www.okex.com/docs-v5/en/#websocket-api-login
 func (c *ClientWs) Login() error {
-	if c.Authorized {
-		return nil
-	}
-	if c.AuthRequested != nil && time.Since(*c.AuthRequested).Seconds() < 30 {
-		return nil
-	}
-	now := time.Now()
-	c.AuthRequested = &now
 	method := http.MethodGet
 	path := "/users/self/verify"
 	ts, sign := c.sign(method, path)
@@ -181,18 +175,6 @@ func (c *ClientWs) Unsubscribe(p bool, ch []okex.ChannelName, args map[string]st
 
 // Send message through either connections
 func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, extras ...map[string]string) error {
-	if op != okex.LoginOperation {
-		if err := c.Connect(p); err != nil {
-			return err
-		}
-		if p {
-			err := c.WaitForAuthorization()
-			if err != nil {
-				return err
-			}
-		}
-	}
-
 	data := map[string]interface{}{
 		"op":   op,
 		"args": args,
@@ -207,6 +189,9 @@ func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, ext
 		return err
 	}
 	c.sendChan[p] <- j
+	if len(c.sendChan[p]) > 10 {
+		c.Logger.Println("[okx] sendChan is almost full:", len(c.sendChan[p]))
+	}
 	return nil
 }
 
@@ -227,24 +212,6 @@ func (c *ClientWs) SetDialer(dialer *websocket.Dialer) {
 func (c *ClientWs) SetEventChannels(structuredEventCh chan interface{}, rawEventCh chan *events.Basic) {
 	c.StructuredEventChan = structuredEventCh
 	c.RawEventChan = rawEventCh
-}
-
-// WaitForAuthorization waits for the auth response and try to log in if it was needed
-func (c *ClientWs) WaitForAuthorization() error {
-	if c.Authorized {
-		return nil
-	}
-	if err := c.Login(); err != nil {
-		return err
-	}
-	ticker := time.NewTicker(time.Millisecond * 300)
-	defer ticker.Stop()
-	for range ticker.C {
-		if c.Authorized {
-			return nil
-		}
-	}
-	return nil
 }
 
 func (c *ClientWs) sender(p bool) error {
@@ -281,10 +248,10 @@ func (c *ClientWs) receiver(p bool) error {
 			mt, data, err := c.conn[p].ReadMessage()
 			if err != nil {
 				c.Logger.Println("[okx] receiver error:", err)
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					return c.conn[p].Close()
+				if err := c.reconnect(p); err != nil {
+					c.Logger.Println("[okx] reconnect error:", err)
+					return err
 				}
-				return err
 			}
 			if mt == websocket.TextMessage && string(data) != "pong" {
 				e := &events.Basic{}
@@ -297,6 +264,34 @@ func (c *ClientWs) receiver(p bool) error {
 			}
 		}
 	}
+}
+
+func (c *ClientWs) reconnect(p bool) error {
+
+	if c.conn[p] != nil {
+		err := c.conn[p].Close()
+		if err != nil {
+			c.Logger.Println("[okx] close conn error:", err)
+		}
+	}
+
+	var err2 error
+	for retry := 0; retry < 3; retry++ {
+		conn, _, err := c.dialer.Dial(string(c.url[p]), nil)
+		if err != nil {
+			c.Logger.Printf("[okx] reconnect err:%v, %d", err, retry)
+			time.Sleep(time.Millisecond * (time.Duration(retry) * 500))
+			continue
+		}
+		err2 = err
+		c.conn[p] = conn
+		if err := c.Login(); err != nil {
+			c.Logger.Println("[okx] login error:", err)
+		}
+		return nil
+	}
+	c.Logger.Printf("[okx] reconnect err:%v, give up", err2)
+	return err2
 }
 
 func (c *ClientWs) sign(method, path string) (string, string) {
@@ -346,12 +341,6 @@ func (c *ClientWs) process(data []byte, e *events.Basic) bool {
 		}
 		return true
 	case "login":
-		if time.Since(*c.AuthRequested).Seconds() > 30 {
-			c.AuthRequested = nil
-			_ = c.Login()
-			break
-		}
-		c.Authorized = true
 		e := events.Login{}
 		_ = json.Unmarshal(data, &e)
 		if c.LoginChan != nil {
