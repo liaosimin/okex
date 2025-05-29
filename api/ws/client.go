@@ -45,12 +45,7 @@ type ClientWs struct {
 	Logger              *log.Logger
 }
 
-const (
-	redialTick = 2 * time.Second
-	writeWait  = 3 * time.Second
-	pongWait   = 30 * time.Second
-	PingPeriod = (pongWait * 8) / 10
-)
+const ()
 
 // NewClient returns a pointer to a fresh ClientWs
 func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url map[bool]okex.BaseURL) (*ClientWs, error) {
@@ -253,30 +248,24 @@ func (c *ClientWs) WaitForAuthorization() error {
 }
 
 func (c *ClientWs) sender(p bool) error {
-	ticker := time.NewTicker(time.Millisecond * 300)
+
+	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case data := <-c.sendChan[p]:
-			err := c.conn[p].SetWriteDeadline(time.Now().Add(writeWait))
+			err := c.conn[p].SetWriteDeadline(time.Now().Add(time.Second * 3))
 			if err != nil {
+				c.Logger.Println("[okx] sender SetWriteDeadline error:", err)
 				return err
 			}
-			w, err := c.conn[p].NextWriter(websocket.TextMessage)
-			if err != nil {
-				return err
-			}
-			if _, err = w.Write(data); err != nil {
-				return err
-			}
-			if err := w.Close(); err != nil {
+			if err := c.conn[p].WriteMessage(websocket.TextMessage, data); err != nil {
+				c.Logger.Println("[okx] sender WriteMessage error:", err)
 				return err
 			}
 		case <-ticker.C:
-			go func() {
-				c.sendChan[p] <- []byte("ping")
-			}()
-
+			c.sendChan[p] <- []byte("ping")
 		case <-c.ctx.Done():
 			return c.handleCancel("sender")
 		}
@@ -289,12 +278,9 @@ func (c *ClientWs) receiver(p bool) error {
 		case <-c.ctx.Done():
 			return c.handleCancel("receiver")
 		default:
-			err := c.conn[p].SetReadDeadline(time.Now().Add(pongWait))
-			if err != nil {
-				return err
-			}
 			mt, data, err := c.conn[p].ReadMessage()
 			if err != nil {
+				c.Logger.Println("[okx] receiver error:", err)
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					return c.conn[p].Close()
 				}
