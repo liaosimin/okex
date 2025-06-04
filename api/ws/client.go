@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -29,8 +30,8 @@ type ClientWs struct {
 	UnsubscribeCh       chan *events.Unsubscribe
 	LoginChan           chan *events.Login
 	SuccessChan         chan *events.Success
-	sendChan            map[bool]chan []byte
 	url                 map[bool]okex.BaseURL
+	sendMu              sync.Mutex
 	conn                map[bool]*websocket.Conn
 	dialer              *websocket.Dialer
 	apiKey              string
@@ -53,7 +54,6 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 		passphrase: passphrase,
 		ctx:        ctx,
 		url:        url,
-		sendChan:   map[bool]chan []byte{true: make(chan []byte, 100), false: make(chan []byte, 100)},
 		DoneChan:   make(chan interface{}),
 		conn:       map[bool]*websocket.Conn{true: nil, false: nil},
 		dialer:     websocket.DefaultDialer,
@@ -99,18 +99,9 @@ func (c *ClientWs) Connect(p bool) error {
 			fmt.Printf("error closing body: %v\n", err)
 		}
 	}(res.Body)
-	go func() {
-		err := c.receiver(p)
-		if err != nil {
-			fmt.Printf("receiver error: %v\n", err)
-		}
-	}()
-	go func() {
-		err := c.sender(p)
-		if err != nil {
-			fmt.Printf("sender error: %v\n", err)
-		}
-	}()
+
+	go c.receiver(p)
+	go c.keepAlive(p)
 
 	return nil
 }
@@ -188,9 +179,19 @@ func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, ext
 	if err != nil {
 		return err
 	}
-	c.sendChan[p] <- j
-	if len(c.sendChan[p]) > 10 {
-		c.Logger.Println("[okx] sendChan is almost full:", len(c.sendChan[p]))
+	return c.send(p, j)
+}
+
+func (c *ClientWs) send(p bool, data []byte) error {
+	if err := c.conn[p].SetWriteDeadline(time.Now().Add(time.Second * 3)); err != nil {
+		c.Logger.Println("[okx] keepAlive SetWriteDeadline error:", err)
+		return err
+	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if err := c.conn[p].WriteMessage(websocket.TextMessage, data); err != nil {
+		c.Logger.Println("[okx] keepAlive WriteMessage error:", err)
+		return err
 	}
 	return nil
 }
@@ -214,49 +215,46 @@ func (c *ClientWs) SetEventChannels(structuredEventCh chan interface{}, rawEvent
 	c.RawEventChan = rawEventCh
 }
 
-func (c *ClientWs) sender(p bool) error {
-
+func (c *ClientWs) keepAlive(p bool) {
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case data := <-c.sendChan[p]:
-			err := c.conn[p].SetWriteDeadline(time.Now().Add(time.Second * 3))
-			if err != nil {
-				c.Logger.Println("[okx] sender SetWriteDeadline error:", err)
-				return err
-			}
-			if err := c.conn[p].WriteMessage(websocket.TextMessage, data); err != nil {
-				c.Logger.Println("[okx] sender WriteMessage error:", err)
-				return err
-			}
 		case <-ticker.C:
-			c.sendChan[p] <- []byte("ping")
+			if err := c.send(p, []byte("ping")); err != nil {
+				c.Logger.Println("[okx] send ping error:", err)
+				if err := c.reconnect(p); err != nil {
+					c.Logger.Println("[okx] reconnect error:", err)
+					continue
+				}
+			}
 		case <-c.ctx.Done():
-			return c.handleCancel("sender")
+			_ = c.handleCancel("keepAlive")
 		}
 	}
 }
 
-func (c *ClientWs) receiver(p bool) error {
+func (c *ClientWs) receiver(p bool) {
 	for {
 		select {
 		case <-c.ctx.Done():
-			return c.handleCancel("receiver")
+			_ = c.handleCancel("receiver")
 		default:
 			mt, data, err := c.conn[p].ReadMessage()
 			if err != nil {
 				c.Logger.Println("[okx] receiver error:", err)
 				if err := c.reconnect(p); err != nil {
 					c.Logger.Println("[okx] reconnect error:", err)
-					return err
+					time.Sleep(time.Second * 5)
+					continue
 				}
 			}
 			if mt == websocket.TextMessage && string(data) != "pong" {
 				e := &events.Basic{}
 				if err := json.Unmarshal(data, &e); err != nil {
-					return err
+					c.Logger.Println("[okx] receiver json.Unmarshal error:", err)
+					continue
 				}
 				go func() {
 					c.process(data, e)
