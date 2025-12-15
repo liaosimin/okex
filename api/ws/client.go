@@ -7,15 +7,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/amir-the-h/okex"
-	"github.com/amir-the-h/okex/events"
-	"github.com/gorilla/websocket"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/amir-the-h/okex"
+	"github.com/amir-the-h/okex/events"
+	"github.com/gorilla/websocket"
 )
 
 // ClientWs is the websocket api client
@@ -32,7 +33,8 @@ type ClientWs struct {
 	SuccessChan         chan *events.Success
 	url                 map[bool]okex.BaseURL
 	sendMu              sync.Mutex
-	conn                map[bool]*websocket.Conn
+	privateConn         *websocket.Conn
+	publicConn          *websocket.Conn
 	dialer              *websocket.Dialer
 	apiKey              string
 	secretKey           []byte
@@ -55,7 +57,6 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 		ctx:        ctx,
 		url:        url,
 		DoneChan:   make(chan interface{}),
-		conn:       map[bool]*websocket.Conn{true: nil, false: nil},
 		dialer:     websocket.DefaultDialer,
 		Logger:     log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile),
 	}
@@ -75,11 +76,26 @@ func NewClient(ctx context.Context, apiKey, secretKey, passphrase string, url ma
 	return c, nil
 }
 
+func (c *ClientWs) getConn(p bool) *websocket.Conn {
+	if p {
+		return c.privateConn
+	}
+	return c.publicConn
+}
+
+func (c *ClientWs) setConn(p bool, conn *websocket.Conn) {
+	if p {
+		c.privateConn = conn
+	} else {
+		c.publicConn = conn
+	}
+}
+
 // Connect into the server
 //
 // https://www.okex.com/docs-v5/en/#websocket-api-connect
 func (c *ClientWs) Connect(p bool) error {
-	if c.conn[p] != nil {
+	if c.getConn(p) != nil {
 		return nil
 	}
 	conn, res, err := c.dialer.Dial(string(c.url[p]), nil)
@@ -91,7 +107,7 @@ func (c *ClientWs) Connect(p bool) error {
 		fmt.Printf("dail url:%s err:%v res:%+v \n", c.url[p], err, res)
 		return fmt.Errorf("dail url:%s err:%v statusCode:%d", c.url[p], err, statusCode)
 	}
-	c.conn[p] = conn
+	c.setConn(p, conn)
 
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
@@ -183,13 +199,17 @@ func (c *ClientWs) Send(p bool, op okex.Operation, args []map[string]string, ext
 }
 
 func (c *ClientWs) send(p bool, data []byte) error {
-	if err := c.conn[p].SetWriteDeadline(time.Now().Add(time.Second * 3)); err != nil {
+	conn := c.getConn(p)
+	if conn == nil {
+		return fmt.Errorf("connection is nil")
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(time.Second * 3)); err != nil {
 		c.Logger.Println("[okx] keepAlive SetWriteDeadline error:", err)
 		return err
 	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
-	if err := c.conn[p].WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		c.Logger.Println("[okx] keepAlive WriteMessage error:", err)
 		return err
 	}
@@ -241,7 +261,13 @@ func (c *ClientWs) receiver(p bool) {
 		case <-c.ctx.Done():
 			_ = c.handleCancel("receiver")
 		default:
-			mt, data, err := c.conn[p].ReadMessage()
+			conn := c.getConn(p)
+			if conn == nil {
+				c.Logger.Println("[okx] receiver error: connection is nil")
+				time.Sleep(time.Second * 1)
+				continue
+			}
+			mt, data, err := conn.ReadMessage()
 			if err != nil {
 				c.Logger.Println("[okx] receiver error:", err)
 				if err := c.reconnect(p); err != nil {
@@ -266,8 +292,9 @@ func (c *ClientWs) receiver(p bool) {
 
 func (c *ClientWs) reconnect(p bool) error {
 
-	if c.conn[p] != nil {
-		err := c.conn[p].Close()
+	conn := c.getConn(p)
+	if conn != nil {
+		err := conn.Close()
 		if err != nil {
 			c.Logger.Println("[okx] close conn error:", err)
 		}
@@ -275,14 +302,14 @@ func (c *ClientWs) reconnect(p bool) error {
 
 	var err2 error
 	for retry := 0; retry < 3; retry++ {
-		conn, _, err := c.dialer.Dial(string(c.url[p]), nil)
+		newConn, _, err := c.dialer.Dial(string(c.url[p]), nil)
 		if err != nil {
 			c.Logger.Printf("[okx] reconnect err:%v, %d", err, retry)
 			time.Sleep(time.Millisecond * (time.Duration(retry) * 500))
 			continue
 		}
 		err2 = err
-		c.conn[p] = conn
+		c.setConn(p, newConn)
 		if err := c.Login(); err != nil {
 			c.Logger.Println("[okx] login error:", err)
 		}
